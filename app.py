@@ -56,7 +56,7 @@ def get_client() -> genai.Client:
 async def process_video(video_path, frame_interval):
     """
     Full Resurrect pipeline for video clips.
-    Takes a B&W video → extracts frames → colorizes → animates → scores.
+    Takes a B&W video → full video analysis → colorizes → animates → scores.
     Yields intermediate results for real-time UI updates.
     """
     if video_path is None:
@@ -67,24 +67,29 @@ async def process_video(video_path, frame_interval):
     tmp_dir = tempfile.mkdtemp(prefix="resurrect_vid_")
     interval = float(frame_interval)
 
+    # Shared state for progress updates from the pipeline
+    latest_status = ["Starting..."]
+
+    async def on_progress(msg):
+        latest_status[0] = msg
+
     try:
-        yield None, None, None, {}, "Step 1: Extracting key frames from video..."
+        yield None, None, None, {}, "Uploading video to Gemini for full scene analysis..."
 
         result = await resurrect_video(
             client=client,
             video_path=video_path,
             tmp_dir=tmp_dir,
             frame_interval_seconds=interval,
-            progress_callback=None,
+            progress_callback=on_progress,
         )
 
         colorized_path = result["colorized_frames"][0] if result["colorized_frames"] else None
         final_video = result["final_video_path"]
         scene = result["scene_analysis"]
-        status = result["status"]
+        status_msg = result["status"]
 
-        # Show first colorized frame as preview
-        yield colorized_path, final_video, video_path, scene, status
+        yield colorized_path, final_video, video_path, scene, status_msg
 
     except Exception as e:
         yield None, None, video_path, {}, f"Error: {e}"
