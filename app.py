@@ -243,8 +243,8 @@ def build_ui():
             c900="#212121", c950="#121212",
             name="neutral",
         ),
-        font=["Google Sans Text", "Google Sans", "Roboto", "system-ui", "sans-serif"],
-        font_mono=["Google Sans Mono", "Roboto Mono", "monospace"],
+        font=[gr.themes.GoogleFont("Google Sans Flex"), "Roboto", "system-ui", "sans-serif"],
+        font_mono=[gr.themes.GoogleFont("Roboto Mono"), "monospace"],
         radius_size=gr.themes.sizes.radius_lg,
     ).set(
         body_background_fill="#f8f9fa",
@@ -272,8 +272,6 @@ def build_ui():
     )
 
     css = """
-    @import url('https://fonts.googleapis.com/css2?family=Google+Sans+Text:ital,wght@0,400;0,500;0,700;1,400&family=Google+Sans+Mono:wght@400;500&display=swap');
-
     .main-title h1 {
         text-align: center;
         font-weight: 500;
@@ -297,7 +295,6 @@ def build_ui():
         line-height: 1.6;
     }
     .status-box textarea {
-        font-family: 'Google Sans Mono', 'Roboto Mono', monospace !important;
         font-size: 0.85rem;
         background: #f8f9fa !important;
         border-color: #e8eaed !important;
@@ -306,7 +303,6 @@ def build_ui():
         max-width: 1200px !important;
     }
     .tab-nav button {
-        font-family: 'Google Sans Text', 'Google Sans', 'Roboto', sans-serif !important;
         font-weight: 500 !important;
         font-size: 0.9rem !important;
         padding: 10px 20px !important;
