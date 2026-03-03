@@ -8,15 +8,12 @@ Modes:
   1. Resurrect Video — Reimagine mode: extract frames → colorize → animate with Veo → score
   2. Colorize Video — Preserve original motion, frame-by-frame colorization + score
   3. Resurrect Photo — Single photo → 8-sec animated + scored video
-  4. API Tester — Verify each API (Gemini, NanoBanana, Veo, Lyria) works individually
 """
 
 import asyncio
 import os
 import io
 import tempfile
-import time
-import traceback
 
 import gradio as gr
 from PIL import Image
@@ -24,13 +21,12 @@ from google import genai
 
 from pipeline import (
     analyze_scene,
-    analyze_video,
     colorize_frame,
     animate_frame,
     resurrect_video,
     colorize_video,
 )
-from lyria_scorer import generate_score, generate_vocal_score
+from lyria_scorer import generate_score
 from video_utils import pcm_to_wav, merge_video_and_score, merge_video_score_only, has_audio_stream
 
 
@@ -225,216 +221,121 @@ async def process_colorize_video(video_path, colorize_every_n, add_vocals, lyric
 
 
 # ---------------------------------------------------------------------------
-# API Test Functions
-# ---------------------------------------------------------------------------
-
-async def test_gemini_analysis(image):
-    """Test Gemini 3.1 Pro scene analysis on a single image."""
-    if image is None:
-        return {}, "Please upload an image first."
-    client = get_client()
-    img = Image.fromarray(image)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    t0 = time.time()
-    try:
-        result = await analyze_scene(client, buf.getvalue())
-        elapsed = time.time() - t0
-        return result, f"Gemini 3.1 Pro analysis complete in {elapsed:.1f}s"
-    except Exception as e:
-        return {}, f"FAILED: {e}\n{traceback.format_exc()}"
-
-
-async def test_nanobanana_colorize(image):
-    """Test NanoBanana 2 colorization."""
-    if image is None:
-        return None, {}, "Please upload an image first."
-    client = get_client()
-    img = Image.fromarray(image)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    image_bytes = buf.getvalue()
-    t0 = time.time()
-    try:
-        scene = await analyze_scene(client, image_bytes)
-        colorized_pil, _ = await colorize_frame(client, image_bytes, scene)
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        colorized_pil.save(tmp.name, format="PNG")
-        elapsed = time.time() - t0
-        return tmp.name, scene, f"NanoBanana 2 colorization complete in {elapsed:.1f}s (includes analysis)"
-    except Exception as e:
-        return None, {}, f"FAILED: {e}\n{traceback.format_exc()}"
-
-
-async def test_veo_animate(image):
-    """Test Veo 3.1 image-to-video animation."""
-    if image is None:
-        return None, "Please upload an image first."
-    client = get_client()
-    img = Image.fromarray(image)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    image_bytes = buf.getvalue()
-    t0 = time.time()
-    try:
-        scene = await analyze_scene(client, image_bytes)
-        colorized_pil, _ = await colorize_frame(client, image_bytes, scene)
-        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_veo_")
-        video_path = os.path.join(tmp_dir, "test_veo.mp4")
-        await animate_frame(client, colorized_pil, scene, video_path)
-        elapsed = time.time() - t0
-        return video_path, f"Veo 3.1 animation complete in {elapsed:.1f}s (includes analysis + colorization)"
-    except Exception as e:
-        return None, f"FAILED: {e}\n{traceback.format_exc()}"
-
-
-async def test_lyria_instrumental(duration):
-    """Test Lyria RealTime instrumental music generation."""
-    client = get_client()
-    dur = int(duration)
-    t0 = time.time()
-    try:
-        test_scene = {
-            "music": {
-                "genre": "jazz",
-                "tempo": "medium",
-                "instruments": "piano, upright bass, brush drums",
-                "mood": "warm, nostalgic, smoky bar atmosphere",
-            }
-        }
-        pcm_data = await generate_score(client, test_scene, duration_seconds=dur)
-        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_lyria_")
-        wav_path = os.path.join(tmp_dir, "test_instrumental.wav")
-        pcm_to_wav(pcm_data, wav_path)
-        elapsed = time.time() - t0
-        size_kb = len(pcm_data) / 1024
-        return wav_path, f"Lyria instrumental: {elapsed:.1f}s, {size_kb:.0f} KB PCM ({dur}s requested)"
-    except Exception as e:
-        return None, f"FAILED: {e}\n{traceback.format_exc()}"
-
-
-async def test_lyria_vocals(duration, lyrics):
-    """Test Lyria RealTime with vocals/lyrics."""
-    client = get_client()
-    dur = int(duration)
-    lyrics_text = lyrics.strip() if lyrics else None
-    t0 = time.time()
-    try:
-        test_scene = {
-            "music": {
-                "genre": "folk ballad",
-                "tempo": "slow",
-                "instruments": "acoustic guitar, violin, gentle vocals",
-                "mood": "melancholic, storytelling, cinematic",
-            }
-        }
-        pcm_data = await generate_vocal_score(
-            client, test_scene, duration_seconds=dur, lyrics=lyrics_text
-        )
-        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_lyria_vocal_")
-        wav_path = os.path.join(tmp_dir, "test_vocals.wav")
-        pcm_to_wav(pcm_data, wav_path)
-        elapsed = time.time() - t0
-        size_kb = len(pcm_data) / 1024
-        return wav_path, f"Lyria vocals: {elapsed:.1f}s, {size_kb:.0f} KB PCM ({dur}s requested)"
-    except Exception as e:
-        return None, f"FAILED: {e}\n{traceback.format_exc()}"
-
-
-async def test_all_apis(image, lyria_duration):
-    """Run all API tests in sequence and report results."""
-    results = []
-
-    # Test 1: Gemini
-    results.append("--- Test 1/4: Gemini 3.1 Pro Scene Analysis ---")
-    try:
-        if image is not None:
-            client = get_client()
-            img = Image.fromarray(image)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            t0 = time.time()
-            scene = await analyze_scene(client, buf.getvalue())
-            results.append(f"PASS ({time.time() - t0:.1f}s) - Era: {scene.get('era', '?')}, Mood: {scene.get('mood', '?')}")
-        else:
-            results.append("SKIP - No image provided")
-            scene = None
-    except Exception as e:
-        results.append(f"FAIL - {e}")
-        scene = None
-
-    # Test 2: NanoBanana
-    results.append("\n--- Test 2/4: NanoBanana 2 Colorization ---")
-    try:
-        if image is not None and scene is not None:
-            img = Image.fromarray(image)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            t0 = time.time()
-            colorized_pil, _ = await colorize_frame(client, buf.getvalue(), scene)
-            results.append(f"PASS ({time.time() - t0:.1f}s) - Output size: {colorized_pil.size}")
-        else:
-            results.append("SKIP - No image or scene analysis failed")
-    except Exception as e:
-        results.append(f"FAIL - {e}")
-
-    # Test 3: Lyria Instrumental
-    results.append("\n--- Test 3/4: Lyria RealTime Instrumental ---")
-    try:
-        client = get_client()
-        test_scene = {"music": {"genre": "orchestral", "tempo": "medium", "instruments": "strings", "mood": "epic"}}
-        t0 = time.time()
-        pcm = await generate_score(client, test_scene, duration_seconds=int(lyria_duration))
-        results.append(f"PASS ({time.time() - t0:.1f}s) - Generated {len(pcm)/1024:.0f} KB PCM")
-    except Exception as e:
-        results.append(f"FAIL - {e}")
-
-    # Test 4: Lyria Vocals
-    results.append("\n--- Test 4/4: Lyria RealTime Vocals ---")
-    try:
-        client = get_client()
-        test_scene = {"music": {"genre": "folk", "tempo": "slow", "instruments": "guitar, vocals", "mood": "warm"}}
-        t0 = time.time()
-        pcm = await generate_vocal_score(client, test_scene, duration_seconds=int(lyria_duration), lyrics="La la la, memories of old")
-        results.append(f"PASS ({time.time() - t0:.1f}s) - Generated {len(pcm)/1024:.0f} KB PCM")
-    except Exception as e:
-        results.append(f"FAIL - {e}")
-
-    results.append("\n--- All tests complete ---")
-    return "\n".join(results)
-
-
-# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
 def build_ui():
     """Build and return the Gradio Blocks interface."""
 
-    with gr.Blocks(
-        title="Resurrect — Old Films → Living Color + Score",
-        theme=gr.themes.Soft(
-            primary_hue="amber",
-            neutral_hue="slate",
+    # Material Design 3 inspired theme
+    theme = gr.themes.Base(
+        primary_hue=gr.themes.Color(
+            c50="#fef7e0", c100="#feeab3", c200="#fedd82",
+            c300="#fed04f", c400="#fec62b", c500="#febb0f",
+            c600="#feb40e", c700="#feaa0b", c800="#fea109",
+            c900="#fe9104", c950="#e67c00",
+            name="amber",
         ),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .status-box { font-family: monospace; }
-        """,
+        neutral_hue=gr.themes.Color(
+            c50="#fafafa", c100="#f5f5f5", c200="#eeeeee",
+            c300="#e0e0e0", c400="#bdbdbd", c500="#9e9e9e",
+            c600="#757575", c700="#616161", c800="#424242",
+            c900="#212121", c950="#121212",
+            name="neutral",
+        ),
+        font=["Google Sans Text", "Google Sans", "Roboto", "system-ui", "sans-serif"],
+        font_mono=["Google Sans Mono", "Roboto Mono", "monospace"],
+        radius_size=gr.themes.sizes.radius_lg,
+    ).set(
+        body_background_fill="#f8f9fa",
+        body_text_color="#1f1f1f",
+        block_background_fill="#ffffff",
+        block_border_width="0px",
+        block_shadow="0 1px 3px 0 rgba(0,0,0,0.1), 0 1px 2px -1px rgba(0,0,0,0.1)",
+        block_label_text_color="#444746",
+        block_title_text_color="#1f1f1f",
+        border_color_primary="#c4c7c5",
+        input_background_fill="#ffffff",
+        input_border_color="#c4c7c5",
+        input_border_width="1px",
+        button_primary_background_fill="#febb0f",
+        button_primary_background_fill_hover="#e6a90e",
+        button_primary_text_color="#1f1f1f",
+        button_primary_border_color="transparent",
+        button_secondary_background_fill="#e8eaed",
+        button_secondary_background_fill_hover="#dadce0",
+        button_secondary_text_color="#1f1f1f",
+        button_large_radius="*radius_lg",
+        checkbox_background_color="#ffffff",
+        checkbox_border_color="#c4c7c5",
+        slider_color="#febb0f",
+    )
+
+    css = """
+    @import url('https://fonts.googleapis.com/css2?family=Google+Sans+Text:ital,wght@0,400;0,500;0,700;1,400&family=Google+Sans+Mono:wght@400;500&display=swap');
+
+    .main-title h1 {
+        text-align: center;
+        font-weight: 500;
+        font-size: 2.5rem;
+        color: #1f1f1f;
+        margin-bottom: 0;
+        letter-spacing: -0.02em;
+    }
+    .subtitle h3 {
+        text-align: center;
+        font-weight: 400;
+        color: #444746;
+        margin-top: 4px;
+        font-size: 1.1rem;
+    }
+    .hero-text p {
+        text-align: center;
+        color: #5f6368;
+        max-width: 640px;
+        margin: 0 auto 24px;
+        line-height: 1.6;
+    }
+    .status-box textarea {
+        font-family: 'Google Sans Mono', 'Roboto Mono', monospace !important;
+        font-size: 0.85rem;
+        background: #f8f9fa !important;
+        border-color: #e8eaed !important;
+    }
+    .gradio-container {
+        max-width: 1200px !important;
+    }
+    .tab-nav button {
+        font-family: 'Google Sans Text', 'Google Sans', 'Roboto', sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 0.9rem !important;
+        padding: 10px 20px !important;
+    }
+    .tab-nav button.selected {
+        border-bottom: 3px solid #febb0f !important;
+        color: #1f1f1f !important;
+    }
+    footer { display: none !important; }
+    """
+
+    with gr.Blocks(
+        title="Resurrect — Old Films to Living Color",
+        theme=theme,
+        css=css,
     ) as demo:
         gr.Markdown(
             "# Resurrect",
             elem_classes="main-title",
         )
         gr.Markdown(
-            "### Old films → living color with a score",
+            "### Old films, living color, original score",
             elem_classes="subtitle",
         )
         gr.Markdown(
             "Upload an old black & white video clip or photograph. "
             "Resurrect will colorize it, bring it to life with motion, and "
-            "compose a period-appropriate musical score — all powered by Google's multimodal AI."
+            "compose a period-appropriate musical score — all powered by Google's multimodal AI.",
+            elem_classes="hero-text",
         )
 
         # ============================================================
@@ -589,95 +490,6 @@ def build_ui():
                 fn=process_image,
                 inputs=[input_image],
                 outputs=[photo_colorized, photo_video_out, photo_scene_info, photo_status],
-            )
-
-        # ============================================================
-        # Tab 4: API Tester
-        # ============================================================
-        with gr.Tab("API Tester", id="api_test_tab"):
-            gr.Markdown(
-                "**Test each API individually** to verify your setup works. "
-                "Upload a test image and hit each button to validate the pipeline step-by-step."
-            )
-
-            with gr.Row():
-                with gr.Column(scale=1):
-                    api_test_image = gr.Image(
-                        label="Test Image (for Gemini/NanoBanana/Veo)",
-                        type="numpy",
-                        height=250,
-                    )
-                    api_lyria_duration = gr.Slider(
-                        minimum=3, maximum=30, value=5, step=1,
-                        label="Lyria Test Duration (seconds)",
-                    )
-
-                with gr.Column(scale=1):
-                    gr.Markdown("### Individual API Tests")
-                    with gr.Row():
-                        btn_test_gemini = gr.Button("Test Gemini Analysis", size="sm")
-                        btn_test_nanobanana = gr.Button("Test NanoBanana Colorize", size="sm")
-                    with gr.Row():
-                        btn_test_veo = gr.Button("Test Veo Animate", size="sm")
-                        btn_test_lyria_inst = gr.Button("Test Lyria Instrumental", size="sm")
-                    with gr.Row():
-                        btn_test_lyria_vocal = gr.Button("Test Lyria Vocals", size="sm")
-                        btn_test_all = gr.Button("Run ALL Tests", variant="primary", size="sm")
-
-            # Lyria vocals test config
-            with gr.Row():
-                api_test_lyrics = gr.Textbox(
-                    label="Test Lyrics (for vocal test)",
-                    value="Walking through the city lights, memories of yesterday, echoes in the night",
-                    lines=2,
-                )
-
-            gr.Markdown("### Results")
-            with gr.Row():
-                api_test_json = gr.JSON(label="Analysis Result")
-                api_test_image_out = gr.Image(label="Colorized Result")
-
-            with gr.Row():
-                api_test_video = gr.Video(label="Veo Result", autoplay=True)
-                api_test_audio = gr.Audio(label="Lyria Result")
-
-            api_test_status = gr.Textbox(
-                label="Test Output",
-                interactive=False,
-                lines=8,
-                elem_classes="status-box",
-            )
-
-            # Wire up individual test buttons
-            btn_test_gemini.click(
-                fn=test_gemini_analysis,
-                inputs=[api_test_image],
-                outputs=[api_test_json, api_test_status],
-            )
-            btn_test_nanobanana.click(
-                fn=test_nanobanana_colorize,
-                inputs=[api_test_image],
-                outputs=[api_test_image_out, api_test_json, api_test_status],
-            )
-            btn_test_veo.click(
-                fn=test_veo_animate,
-                inputs=[api_test_image],
-                outputs=[api_test_video, api_test_status],
-            )
-            btn_test_lyria_inst.click(
-                fn=test_lyria_instrumental,
-                inputs=[api_lyria_duration],
-                outputs=[api_test_audio, api_test_status],
-            )
-            btn_test_lyria_vocal.click(
-                fn=test_lyria_vocals,
-                inputs=[api_lyria_duration, api_test_lyrics],
-                outputs=[api_test_audio, api_test_status],
-            )
-            btn_test_all.click(
-                fn=test_all_apis,
-                inputs=[api_test_image, api_lyria_duration],
-                outputs=[api_test_status],
             )
 
         # ============================================================
