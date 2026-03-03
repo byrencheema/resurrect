@@ -4,29 +4,33 @@ app.py - Gradio UI + main orchestration for Resurrect.
 Upload an old B&W video clip or photograph → get back a colorized,
 animated, musically scored video.
 
-Primary mode: Video → Video (e.g., Charlie Chaplin clip → living color + score)
-Secondary mode: Single photo → 8-sec video
+Modes:
+  1. Resurrect Video — Reimagine mode: extract frames → colorize → animate with Veo → score
+  2. Colorize Video — Preserve original motion, frame-by-frame colorization + score
+  3. Resurrect Photo — Single photo → 8-sec animated + scored video
+  4. API Tester — Verify each API (Gemini, NanoBanana, Veo, Lyria) works individually
 """
 
 import asyncio
 import os
 import io
 import tempfile
+import time
+import traceback
 
 import gradio as gr
-import numpy as np
 from PIL import Image
 from google import genai
-from google.genai import types
 
 from pipeline import (
     analyze_scene,
+    analyze_video,
     colorize_frame,
     animate_frame,
-    resurrect_image,
     resurrect_video,
+    colorize_video,
 )
-from lyria_scorer import generate_score
+from lyria_scorer import generate_score, generate_vocal_score
 from video_utils import pcm_to_wav, merge_video_and_score, merge_video_score_only, has_audio_stream
 
 
@@ -179,41 +183,225 @@ async def process_image(image):
 
 
 # ---------------------------------------------------------------------------
-# Quick Test Functions
+# Colorize-Only Video Processing
 # ---------------------------------------------------------------------------
 
-async def test_analyze(image):
-    """Test just the scene analysis step."""
+async def process_colorize_video(video_path, colorize_every_n, add_vocals, lyrics_text):
+    """
+    Colorize-only mode: preserves original motion, just adds color + score.
+    Yields intermediate results for real-time UI updates.
+    """
+    if video_path is None:
+        yield None, None, {}, "Please upload a black & white video clip."
+        return
+
+    client = get_client()
+    tmp_dir = tempfile.mkdtemp(prefix="resurrect_colorize_")
+    every_n = int(colorize_every_n)
+
+    async def on_progress(msg):
+        pass  # Status updates come via yields below
+
+    try:
+        yield None, None, {}, "Starting colorize-only pipeline (preserves original motion)..."
+
+        result = await colorize_video(
+            client=client,
+            video_path=video_path,
+            tmp_dir=tmp_dir,
+            colorize_every_n=every_n,
+            progress_callback=on_progress,
+            vocals_lyrics=lyrics_text.strip() if add_vocals and lyrics_text.strip() else None,
+        )
+
+        final_video = result["final_video_path"]
+        scene = result["scene_analysis"]
+        status_msg = result["status"]
+
+        yield final_video, video_path, scene, status_msg
+
+    except Exception as e:
+        yield None, video_path, {}, f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# API Test Functions
+# ---------------------------------------------------------------------------
+
+async def test_gemini_analysis(image):
+    """Test Gemini 3.1 Pro scene analysis on a single image."""
     if image is None:
-        return {}, "Please upload an image."
+        return {}, "Please upload an image first."
     client = get_client()
     img = Image.fromarray(image)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=95)
+    t0 = time.time()
     try:
         result = await analyze_scene(client, buf.getvalue())
-        return result, "Scene analysis complete."
+        elapsed = time.time() - t0
+        return result, f"Gemini 3.1 Pro analysis complete in {elapsed:.1f}s"
     except Exception as e:
-        return {}, f"Error: {e}"
+        return {}, f"FAILED: {e}\n{traceback.format_exc()}"
 
 
-async def test_colorize(image):
-    """Test scene analysis + colorization."""
+async def test_nanobanana_colorize(image):
+    """Test NanoBanana 2 colorization."""
     if image is None:
-        return None, "Please upload an image."
+        return None, {}, "Please upload an image first."
     client = get_client()
     img = Image.fromarray(image)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=95)
     image_bytes = buf.getvalue()
+    t0 = time.time()
     try:
         scene = await analyze_scene(client, image_bytes)
         colorized_pil, _ = await colorize_frame(client, image_bytes, scene)
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         colorized_pil.save(tmp.name, format="PNG")
-        return tmp.name, "Colorization complete."
+        elapsed = time.time() - t0
+        return tmp.name, scene, f"NanoBanana 2 colorization complete in {elapsed:.1f}s (includes analysis)"
     except Exception as e:
-        return None, f"Error: {e}"
+        return None, {}, f"FAILED: {e}\n{traceback.format_exc()}"
+
+
+async def test_veo_animate(image):
+    """Test Veo 3.1 image-to-video animation."""
+    if image is None:
+        return None, "Please upload an image first."
+    client = get_client()
+    img = Image.fromarray(image)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    image_bytes = buf.getvalue()
+    t0 = time.time()
+    try:
+        scene = await analyze_scene(client, image_bytes)
+        colorized_pil, _ = await colorize_frame(client, image_bytes, scene)
+        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_veo_")
+        video_path = os.path.join(tmp_dir, "test_veo.mp4")
+        await animate_frame(client, colorized_pil, scene, video_path)
+        elapsed = time.time() - t0
+        return video_path, f"Veo 3.1 animation complete in {elapsed:.1f}s (includes analysis + colorization)"
+    except Exception as e:
+        return None, f"FAILED: {e}\n{traceback.format_exc()}"
+
+
+async def test_lyria_instrumental(duration):
+    """Test Lyria RealTime instrumental music generation."""
+    client = get_client()
+    dur = int(duration)
+    t0 = time.time()
+    try:
+        test_scene = {
+            "music": {
+                "genre": "jazz",
+                "tempo": "medium",
+                "instruments": "piano, upright bass, brush drums",
+                "mood": "warm, nostalgic, smoky bar atmosphere",
+            }
+        }
+        pcm_data = await generate_score(client, test_scene, duration_seconds=dur)
+        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_lyria_")
+        wav_path = os.path.join(tmp_dir, "test_instrumental.wav")
+        pcm_to_wav(pcm_data, wav_path)
+        elapsed = time.time() - t0
+        size_kb = len(pcm_data) / 1024
+        return wav_path, f"Lyria instrumental: {elapsed:.1f}s, {size_kb:.0f} KB PCM ({dur}s requested)"
+    except Exception as e:
+        return None, f"FAILED: {e}\n{traceback.format_exc()}"
+
+
+async def test_lyria_vocals(duration, lyrics):
+    """Test Lyria RealTime with vocals/lyrics."""
+    client = get_client()
+    dur = int(duration)
+    lyrics_text = lyrics.strip() if lyrics else None
+    t0 = time.time()
+    try:
+        test_scene = {
+            "music": {
+                "genre": "folk ballad",
+                "tempo": "slow",
+                "instruments": "acoustic guitar, violin, gentle vocals",
+                "mood": "melancholic, storytelling, cinematic",
+            }
+        }
+        pcm_data = await generate_vocal_score(
+            client, test_scene, duration_seconds=dur, lyrics=lyrics_text
+        )
+        tmp_dir = tempfile.mkdtemp(prefix="resurrect_test_lyria_vocal_")
+        wav_path = os.path.join(tmp_dir, "test_vocals.wav")
+        pcm_to_wav(pcm_data, wav_path)
+        elapsed = time.time() - t0
+        size_kb = len(pcm_data) / 1024
+        return wav_path, f"Lyria vocals: {elapsed:.1f}s, {size_kb:.0f} KB PCM ({dur}s requested)"
+    except Exception as e:
+        return None, f"FAILED: {e}\n{traceback.format_exc()}"
+
+
+async def test_all_apis(image, lyria_duration):
+    """Run all API tests in sequence and report results."""
+    results = []
+
+    # Test 1: Gemini
+    results.append("--- Test 1/4: Gemini 3.1 Pro Scene Analysis ---")
+    try:
+        if image is not None:
+            client = get_client()
+            img = Image.fromarray(image)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=95)
+            t0 = time.time()
+            scene = await analyze_scene(client, buf.getvalue())
+            results.append(f"PASS ({time.time() - t0:.1f}s) - Era: {scene.get('era', '?')}, Mood: {scene.get('mood', '?')}")
+        else:
+            results.append("SKIP - No image provided")
+            scene = None
+    except Exception as e:
+        results.append(f"FAIL - {e}")
+        scene = None
+
+    # Test 2: NanoBanana
+    results.append("\n--- Test 2/4: NanoBanana 2 Colorization ---")
+    try:
+        if image is not None and scene is not None:
+            img = Image.fromarray(image)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=95)
+            t0 = time.time()
+            colorized_pil, _ = await colorize_frame(client, buf.getvalue(), scene)
+            results.append(f"PASS ({time.time() - t0:.1f}s) - Output size: {colorized_pil.size}")
+        else:
+            results.append("SKIP - No image or scene analysis failed")
+    except Exception as e:
+        results.append(f"FAIL - {e}")
+
+    # Test 3: Lyria Instrumental
+    results.append("\n--- Test 3/4: Lyria RealTime Instrumental ---")
+    try:
+        client = get_client()
+        test_scene = {"music": {"genre": "orchestral", "tempo": "medium", "instruments": "strings", "mood": "epic"}}
+        t0 = time.time()
+        pcm = await generate_score(client, test_scene, duration_seconds=int(lyria_duration))
+        results.append(f"PASS ({time.time() - t0:.1f}s) - Generated {len(pcm)/1024:.0f} KB PCM")
+    except Exception as e:
+        results.append(f"FAIL - {e}")
+
+    # Test 4: Lyria Vocals
+    results.append("\n--- Test 4/4: Lyria RealTime Vocals ---")
+    try:
+        client = get_client()
+        test_scene = {"music": {"genre": "folk", "tempo": "slow", "instruments": "guitar, vocals", "mood": "warm"}}
+        t0 = time.time()
+        pcm = await generate_vocal_score(client, test_scene, duration_seconds=int(lyria_duration), lyrics="La la la, memories of old")
+        results.append(f"PASS ({time.time() - t0:.1f}s) - Generated {len(pcm)/1024:.0f} KB PCM")
+    except Exception as e:
+        results.append(f"FAIL - {e}")
+
+    results.append("\n--- All tests complete ---")
+    return "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +490,68 @@ def build_ui():
             )
 
         # ============================================================
-        # Tab 2: Photo → Video (Secondary Feature)
+        # Tab 2: Colorize Video (Preserve Original Motion)
+        # ============================================================
+        with gr.Tab("Colorize Video", id="colorize_tab"):
+            gr.Markdown(
+                "**Colorize-only mode**: Preserves the original motion frame-by-frame. "
+                "Best for clips where you want to keep the exact performance (e.g., Charlie Chaplin's "
+                "physical comedy) but add color and a musical score. No Veo re-animation — just "
+                "NanoBanana 2 colorization on every frame + Lyria score."
+            )
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    colorize_input_video = gr.Video(
+                        label="Upload B&W Video Clip",
+                        sources=["upload"],
+                    )
+                    colorize_every_n = gr.Slider(
+                        minimum=1,
+                        maximum=10,
+                        value=1,
+                        step=1,
+                        label="Colorize Every Nth Frame",
+                        info="1 = every frame (best quality, slowest). 3 = every 3rd frame (faster, slight choppiness).",
+                    )
+                    colorize_add_vocals = gr.Checkbox(
+                        label="Add vocal textures to score",
+                        value=False,
+                        info="Use Lyria VOCALIZATION mode for oohs/aahs vocal textures. Text below influences mood.",
+                    )
+                    colorize_lyrics = gr.Textbox(
+                        label="Vocal mood/theme (optional)",
+                        placeholder="E.g., 'Walking through the rain, memories remain...' (influences style, not literal singing)",
+                        lines=3,
+                        visible=True,
+                    )
+                    btn_colorize_video = gr.Button(
+                        "Colorize Video",
+                        variant="primary",
+                        size="lg",
+                    )
+                    colorize_status = gr.Textbox(
+                        label="Status",
+                        interactive=False,
+                        lines=3,
+                        elem_classes="status-box",
+                    )
+
+                with gr.Column(scale=1):
+                    colorize_scene_info = gr.JSON(label="Scene Analysis")
+
+            with gr.Row():
+                colorize_output = gr.Video(label="Colorized Video", autoplay=True)
+                colorize_original = gr.Video(label="Original (for comparison)")
+
+            btn_colorize_video.click(
+                fn=process_colorize_video,
+                inputs=[colorize_input_video, colorize_every_n, colorize_add_vocals, colorize_lyrics],
+                outputs=[colorize_output, colorize_original, colorize_scene_info, colorize_status],
+            )
+
+        # ============================================================
+        # Tab 3: Photo → Video (Secondary Feature)
         # ============================================================
         with gr.Tab("Resurrect Photo", id="photo_tab"):
             gr.Markdown(
@@ -343,29 +592,92 @@ def build_ui():
             )
 
         # ============================================================
-        # Tab 3: Developer Tools
+        # Tab 4: API Tester
         # ============================================================
-        with gr.Tab("Developer Tools", id="dev_tab"):
-            gr.Markdown("Test individual pipeline steps for debugging and verification.")
-
-            dev_image = gr.Image(label="Test Image", type="numpy", height=300)
-            with gr.Row():
-                btn_analyze = gr.Button("Test: Analyze Scene Only")
-                btn_colorize = gr.Button("Test: Analyze + Colorize")
-            with gr.Row():
-                test_json = gr.JSON(label="Scene Analysis Result")
-                test_image = gr.Image(label="Colorized Result")
-            test_status = gr.Textbox(label="Test Status", interactive=False)
-
-            btn_analyze.click(
-                fn=test_analyze,
-                inputs=[dev_image],
-                outputs=[test_json, test_status],
+        with gr.Tab("API Tester", id="api_test_tab"):
+            gr.Markdown(
+                "**Test each API individually** to verify your setup works. "
+                "Upload a test image and hit each button to validate the pipeline step-by-step."
             )
-            btn_colorize.click(
-                fn=test_colorize,
-                inputs=[dev_image],
-                outputs=[test_image, test_status],
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    api_test_image = gr.Image(
+                        label="Test Image (for Gemini/NanoBanana/Veo)",
+                        type="numpy",
+                        height=250,
+                    )
+                    api_lyria_duration = gr.Slider(
+                        minimum=3, maximum=30, value=5, step=1,
+                        label="Lyria Test Duration (seconds)",
+                    )
+
+                with gr.Column(scale=1):
+                    gr.Markdown("### Individual API Tests")
+                    with gr.Row():
+                        btn_test_gemini = gr.Button("Test Gemini Analysis", size="sm")
+                        btn_test_nanobanana = gr.Button("Test NanoBanana Colorize", size="sm")
+                    with gr.Row():
+                        btn_test_veo = gr.Button("Test Veo Animate", size="sm")
+                        btn_test_lyria_inst = gr.Button("Test Lyria Instrumental", size="sm")
+                    with gr.Row():
+                        btn_test_lyria_vocal = gr.Button("Test Lyria Vocals", size="sm")
+                        btn_test_all = gr.Button("Run ALL Tests", variant="primary", size="sm")
+
+            # Lyria vocals test config
+            with gr.Row():
+                api_test_lyrics = gr.Textbox(
+                    label="Test Lyrics (for vocal test)",
+                    value="Walking through the city lights, memories of yesterday, echoes in the night",
+                    lines=2,
+                )
+
+            gr.Markdown("### Results")
+            with gr.Row():
+                api_test_json = gr.JSON(label="Analysis Result")
+                api_test_image_out = gr.Image(label="Colorized Result")
+
+            with gr.Row():
+                api_test_video = gr.Video(label="Veo Result", autoplay=True)
+                api_test_audio = gr.Audio(label="Lyria Result")
+
+            api_test_status = gr.Textbox(
+                label="Test Output",
+                interactive=False,
+                lines=8,
+                elem_classes="status-box",
+            )
+
+            # Wire up individual test buttons
+            btn_test_gemini.click(
+                fn=test_gemini_analysis,
+                inputs=[api_test_image],
+                outputs=[api_test_json, api_test_status],
+            )
+            btn_test_nanobanana.click(
+                fn=test_nanobanana_colorize,
+                inputs=[api_test_image],
+                outputs=[api_test_image_out, api_test_json, api_test_status],
+            )
+            btn_test_veo.click(
+                fn=test_veo_animate,
+                inputs=[api_test_image],
+                outputs=[api_test_video, api_test_status],
+            )
+            btn_test_lyria_inst.click(
+                fn=test_lyria_instrumental,
+                inputs=[api_lyria_duration],
+                outputs=[api_test_audio, api_test_status],
+            )
+            btn_test_lyria_vocal.click(
+                fn=test_lyria_vocals,
+                inputs=[api_lyria_duration, api_test_lyrics],
+                outputs=[api_test_audio, api_test_status],
+            )
+            btn_test_all.click(
+                fn=test_all_apis,
+                inputs=[api_test_image, api_lyria_duration],
+                outputs=[api_test_status],
             )
 
         # ============================================================

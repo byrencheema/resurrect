@@ -21,13 +21,15 @@ from google.genai import types
 from PIL import Image
 import numpy as np
 
-from lyria_scorer import generate_score
+from lyria_scorer import generate_score, generate_vocal_score
 from video_utils import (
     pcm_to_wav,
     merge_video_and_score,
     merge_video_score_only,
     has_audio_stream,
     extract_keyframes,
+    extract_all_frames,
+    reassemble_frames,
     stitch_video_clips,
     get_video_duration,
 )
@@ -36,9 +38,22 @@ from video_utils import (
 def _parse_json_response(text: str) -> dict:
     """Parse JSON from a model response, stripping markdown fences if present."""
     text = text.strip()
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
     if text.startswith("```"):
         lines = text.split("\n")
-        text = "\n".join(lines[1:-1])
+        # Remove opening fence (may be ```json, ```JSON, etc.)
+        start = 1
+        # Remove closing fence
+        end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+        text = "\n".join(lines[start:end])
+    # Try to extract JSON if there's extra text around it
+    text = text.strip()
+    if not text.startswith("{"):
+        # Find the first { and last }
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start != -1 and brace_end != -1:
+            text = text[brace_start:brace_end + 1]
     return json.loads(text)
 
 
@@ -105,6 +120,11 @@ async def analyze_video(client: genai.Client, video_path: str, num_scenes: int =
     """
     # Upload the video file to Gemini Files API
     uploaded_file = await client.aio.files.upload(file=video_path)
+
+    # Wait for file processing to complete (large videos may need time)
+    while uploaded_file.state and uploaded_file.state.name == "PROCESSING":
+        await asyncio.sleep(2)
+        uploaded_file = await client.aio.files.get(name=uploaded_file.name)
 
     prompt = """Analyze this old black and white film clip for restoration. Return valid JSON only, no markdown fences.
 
@@ -200,8 +220,18 @@ Photorealistic result. Do not add or remove any elements."""
         config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
     )
 
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
+    if not response.candidates:
+        raise RuntimeError("NanoBanana 2 returned no candidates (may have been safety-filtered).")
+
+    candidate = response.candidates[0]
+    if not candidate.content or not candidate.content.parts:
+        raise RuntimeError(
+            f"NanoBanana 2 returned empty content. "
+            f"Finish reason: {getattr(candidate, 'finish_reason', 'unknown')}"
+        )
+
+    for part in candidate.content.parts:
+        if part.inline_data is not None and part.inline_data.data:
             raw_bytes = part.inline_data.data
             pil_image = Image.open(io.BytesIO(raw_bytes))
             return pil_image, raw_bytes
@@ -261,9 +291,21 @@ async def animate_frame(
     )
 
     # Poll until generation is complete (can take 11 sec to 6+ min)
+    # Timeout after 10 minutes to prevent infinite hangs
+    max_wait = 600  # 10 minutes
+    waited = 0
     while not operation.done:
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
+        waited += 10
+        if waited >= max_wait:
+            raise TimeoutError(
+                f"Veo video generation timed out after {max_wait}s. "
+                f"Operation: {getattr(operation, 'name', 'unknown')}"
+            )
         operation = client.operations.get(operation)
+
+    if not operation.response or not operation.response.generated_videos:
+        raise RuntimeError("Veo returned no generated videos.")
 
     # Download and save the generated video
     generated_video = operation.response.generated_videos[0]
@@ -536,5 +578,158 @@ async def resurrect_video(
         "clip_paths": clip_paths,
         "final_video_path": final_video_path,
         "scene_analysis": video_analysis,
+        "status": status_msg,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Colorize-Only Video Pipeline (preserves original motion)
+# ---------------------------------------------------------------------------
+
+async def colorize_video(
+    client: genai.Client,
+    video_path: str,
+    tmp_dir: str = None,
+    colorize_every_n: int = 1,
+    progress_callback=None,
+    vocals_lyrics: str = None,
+) -> dict:
+    """
+    Colorize a B&W video frame-by-frame, preserving the original motion.
+
+    Unlike resurrect_video (which uses Veo to generate new motion), this mode:
+      - Extracts every frame from the original video
+      - Colorizes each frame with NanoBanana 2
+      - Reassembles at the original FPS
+      - Adds a Lyria musical score
+
+    The result keeps Charlie Chaplin's original performance intact — just in color
+    with music.
+
+    Args:
+        client: Google GenAI client
+        video_path: Path to B&W video file
+        tmp_dir: Temp directory
+        colorize_every_n: Colorize every Nth frame (1=all, 2=half, etc.).
+            Frames between colorized ones are interpolated by copying the
+            nearest colorized frame. Higher = faster but choppier.
+        progress_callback: Optional async callable for status updates
+
+    Returns dict with final_video_path, scene_analysis, colorized_count, status.
+    """
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix="resurrect_color_")
+
+    raw_frames_dir = os.path.join(tmp_dir, "raw_frames")
+    colorized_dir = os.path.join(tmp_dir, "colorized_frames")
+    os.makedirs(raw_frames_dir, exist_ok=True)
+    os.makedirs(colorized_dir, exist_ok=True)
+
+    async def status(msg):
+        if progress_callback:
+            await progress_callback(msg)
+
+    # --- Step 1: Analyze the full video ---
+    await status("Analyzing video with Gemini 3.1 Pro...")
+    video_analysis = await analyze_video(client, video_path)
+    overall = video_analysis.get("overall", {})
+    scenes = video_analysis.get("scenes", [])
+
+    # Build a simple scene lookup for frame-level color guidance
+    scene_data_default = {
+        "era": overall.get("era", "early 20th century"),
+        "colors": scenes[0].get("colors", {}) if scenes else {},
+    }
+
+    # --- Step 2: Extract ALL frames ---
+    await status("Extracting all frames from video...")
+    frame_paths, fps = extract_all_frames(video_path, raw_frames_dir)
+
+    if not frame_paths:
+        return {
+            "final_video_path": None,
+            "scene_analysis": video_analysis,
+            "colorized_count": 0,
+            "status": "No frames could be extracted.",
+        }
+
+    total_frames = len(frame_paths)
+    await status(f"Extracted {total_frames} frames at {fps:.1f} FPS. Colorizing...")
+
+    # --- Step 3: Colorize frames ---
+    colorized_count = 0
+    last_colorized_path = None
+
+    for i, frame_path in enumerate(frame_paths):
+        output_path = os.path.join(colorized_dir, f"colorized_{i + 1:06d}.png")
+
+        if i % colorize_every_n == 0:
+            # Colorize this frame
+            with open(frame_path, "rb") as f:
+                frame_bytes = f.read()
+
+            try:
+                colorized_pil, _ = await colorize_frame(
+                    client, frame_bytes, scene_data_default
+                )
+                colorized_pil.save(output_path, format="PNG")
+                last_colorized_path = output_path
+                colorized_count += 1
+            except Exception:
+                # Fallback: copy the original frame (B&W is better than nothing)
+                if last_colorized_path:
+                    shutil.copy2(last_colorized_path, output_path)
+                else:
+                    shutil.copy2(frame_path, output_path)
+        else:
+            # Copy the last colorized frame (nearest-neighbor interpolation)
+            if last_colorized_path:
+                shutil.copy2(last_colorized_path, output_path)
+            else:
+                shutil.copy2(frame_path, output_path)
+
+        # Progress update every 10 frames
+        if i % 10 == 0:
+            await status(f"Colorized {colorized_count}/{total_frames} frames...")
+
+    # --- Step 4: Generate musical score ---
+    video_duration = total_frames / fps
+    score_duration = min(int(video_duration) + 2, 598)
+
+    score_type = "vocal score" if vocals_lyrics else "musical score"
+    await status(f"Generating {score_duration}s {score_type} + reassembling video...")
+
+    score_analysis = {
+        "music": overall.get("music", {
+            "genre": "orchestral",
+            "tempo": "medium",
+            "instruments": "piano, strings",
+            "mood": "nostalgic, cinematic",
+        })
+    }
+
+    if vocals_lyrics:
+        score_pcm = await generate_vocal_score(
+            client, score_analysis, duration_seconds=score_duration, lyrics=vocals_lyrics
+        )
+    else:
+        score_pcm = await generate_score(client, score_analysis, duration_seconds=score_duration)
+
+    # --- Step 5: Reassemble colorized frames into video ---
+    score_wav_path = os.path.join(tmp_dir, "score.wav")
+    pcm_to_wav(score_pcm, score_wav_path)
+
+    final_video_path = os.path.join(tmp_dir, "colorized.mp4")
+    reassemble_frames(colorized_dir, final_video_path, fps, audio_path=score_wav_path)
+
+    status_msg = (
+        f"Done! Colorized {colorized_count} of {total_frames} frames "
+        f"({video_duration:.1f}s video at {fps:.0f} FPS) with musical score."
+    )
+
+    return {
+        "final_video_path": final_video_path,
+        "scene_analysis": video_analysis,
+        "colorized_count": colorized_count,
         "status": status_msg,
     }

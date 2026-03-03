@@ -101,6 +101,7 @@ def extract_keyframes(video_path: str, output_dir: str, interval_seconds: float 
         'ffmpeg', '-y',
         '-i', video_path,
         '-vf', f'fps=1/{interval_seconds}',
+        '-q:v', '2',  # High quality JPEG (2 = near lossless)
         os.path.join(output_dir, 'frame_%04d.jpg')
     ]
 
@@ -128,12 +129,15 @@ def stitch_video_clips(clip_paths: list[str], output_path: str) -> str:
         concat_file = f.name
 
     try:
+        # Re-encode to ensure compatibility across clips with different codecs/resolutions
         cmd = [
             'ffmpeg', '-y',
             '-f', 'concat',
             '-safe', '0',
             '-i', concat_file,
-            '-c', 'copy',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart',
             output_path
         ]
 
@@ -176,3 +180,92 @@ def has_audio_stream(video_path: str) -> bool:
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     return bool(result.stdout.strip())
+
+
+def extract_all_frames(video_path: str, output_dir: str) -> tuple[list[str], float]:
+    """
+    Extract ALL frames from a video at original framerate.
+
+    Returns (list of frame paths, fps of the original video).
+    """
+    check_ffmpeg()
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get the original video FPS
+    cmd_fps = [
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=r_frame_rate',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_path
+    ]
+    result = subprocess.run(cmd_fps, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe fps failed: {result.stderr}")
+    fps_str = result.stdout.strip()
+    # fps_str is like "24/1" or "30000/1001"
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(fps_str)
+
+    # Extract all frames as PNG (lossless for colorization quality)
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-q:v', '1',
+        os.path.join(output_dir, 'frame_%06d.png')
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Frame extraction failed: {result.stderr}")
+
+    frames = sorted(
+        [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith('frame_')]
+    )
+    return frames, fps
+
+
+def reassemble_frames(
+    frame_dir: str, output_path: str, fps: float,
+    audio_path: str = None,
+) -> str:
+    """
+    Reassemble colorized frames back into a video at the original FPS.
+
+    Args:
+        frame_dir: Directory containing colorized_NNNNNN.png files
+        output_path: Where to write the final MP4
+        fps: Frames per second for the output
+        audio_path: Optional audio track to mux in (WAV or AAC)
+    """
+    check_ffmpeg()
+
+    input_pattern = os.path.join(frame_dir, 'colorized_%06d.png')
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-framerate', str(fps),
+        '-i', input_pattern,
+    ]
+
+    if audio_path:
+        cmd.extend(['-i', audio_path])
+
+    cmd.extend([
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+    ])
+
+    if audio_path:
+        cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-shortest'])
+
+    cmd.extend(['-movflags', '+faststart', output_path])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Frame reassembly failed: {result.stderr}")
+
+    return output_path
